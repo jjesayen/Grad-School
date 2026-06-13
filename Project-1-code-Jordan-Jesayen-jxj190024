@@ -1,0 +1,230 @@
+"""
+Project 1 Code Template
+SBA Loan Default Prediction
+
+Copy or rename this file to:
+
+    Project-1-code-FirstName-LastName-NetID.py
+
+Complete this file with your data preparation, feature engineering, model
+tuning, evaluation, final model selection, and artifact-saving workflow.
+
+Final submission is Python code + Markdown report + artifacts, not a Jupyter
+notebook.
+"""
+
+from pathlib import Path
+
+import h2o
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    log_loss,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+
+
+RANDOM_STATE = 42
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_ROOT / "data"
+ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
+IMAGES_DIR = ARTIFACTS_DIR / "images"
+
+TRAIN_DATA_PATH = DATA_DIR / "SBA_loans_project_1.csv.zip"
+HOLDOUT_FORMAT_PATH = DATA_DIR / "SBA_loans_project_1_holdout_students_valid_no_labels.csv.zip"
+TARGET_COL = "MIS_Status"
+
+
+def ensure_output_dirs():
+    """Create output folders used by your completed project code."""
+    ARTIFACTS_DIR.mkdir(exist_ok=True)
+    IMAGES_DIR.mkdir(exist_ok=True)
+
+
+def load_training_data():
+    """Load the labeled Project 1 training data."""
+    return pd.read_csv(TRAIN_DATA_PATH)
+
+
+def run_data_quality_checks(df):
+    """
+    Inspect missingness, types, invalid values, and target distribution.
+
+    Save or print the checks that support your report. Do not fit learned
+    transformations in this function.
+    """
+    raise NotImplementedError("Add your data quality checks here.")
+
+
+def split_data(df):
+    """
+    Split labeled data into Train, Validation, and Test.
+
+    Split before fitting imputers, encoders, scalers, feature selectors,
+    target encoders, WOE encoders, or models.
+    """
+    y = df[TARGET_COL]
+    X = df.drop(columns=[TARGET_COL])
+
+    X_train, X_temp, y_train, y_temp = train_test_split(
+        X,
+        y,
+        test_size=0.30,
+        random_state=RANDOM_STATE,
+        stratify=y,
+    )
+    X_valid, X_test, y_valid, y_test = train_test_split(
+        X_temp,
+        y_temp,
+        test_size=0.50,
+        random_state=RANDOM_STATE,
+        stratify=y_temp,
+    )
+
+    return X_train, X_valid, X_test, y_train, y_valid, y_test
+
+
+def clean_and_prepare_train(X_train, y_train):
+    """
+    Fit training-only cleaning and preprocessing objects.
+
+    Examples include imputers, categorical encoders, WOE/target encoders, and
+    scalers. Fit these objects on Train only. Return transformed Train data
+    plus a dictionary of fitted artifacts needed for Validation, Test, and
+    scoring.
+    """
+    raise NotImplementedError("Fit training-only preprocessing here.")
+
+
+def apply_cleaning_and_preprocessing(X, preprocessing_artifacts):
+    """
+    Apply fitted preprocessing objects to Validation, Test, or scoring data.
+
+    Use transform-style behavior only. Do not fit anything here.
+    """
+    raise NotImplementedError("Apply fitted preprocessing here.")
+
+
+def add_engineered_features(X):
+    """
+    Add at least 10 qualifying engineered features.
+
+    One-hot encoded columns, label encoded columns, target encoded columns, and
+    simple direct copies of existing columns do not count toward the 10 required
+    engineered features. Keep this function reproducible so the same logic can
+    be used in the scoring file.
+    """
+    raise NotImplementedError("Create your engineered features here.")
+
+
+def tune_sklearn_logistic_regression(X_train, y_train, X_valid, y_valid):
+    """
+    Train and tune sklearn Logistic Regression variants.
+
+    Requirements:
+    - evaluate at least 50 hyperparameter combinations;
+    - use AUCPR or Log-loss for tuning/model selection;
+    - keep the Test set locked until final evaluation.
+    """
+    raise NotImplementedError("Tune sklearn Logistic Regression models here.")
+
+
+def tune_h2o_glm(X_train, y_train, X_valid, y_valid):
+    """
+    Train and tune H2O-3 GLM binomial variants.
+
+    Use bounded H2O initialization unless the instructor approves another setup:
+
+        h2o.init(name="ML_Project_Cluster", max_mem_size="4G", nthreads=4, verbose=False)
+
+    Requirements:
+    - evaluate at least 50 hyperparameter combinations;
+    - use AUCPR or Log-loss for tuning/model selection;
+    - keep the Test set locked until final evaluation.
+    """
+    raise NotImplementedError("Tune H2O-3 GLM models here.")
+
+
+def find_best_f1_threshold(y_true, probability_1):
+    """Search thresholds and return the threshold with the best F1 score."""
+    thresholds = np.linspace(0.01, 0.99, 99)
+    best_threshold = None
+    best_f1 = -np.inf
+
+    for threshold in thresholds:
+        labels = (probability_1 >= threshold).astype(int)
+        score = f1_score(y_true, labels, average="macro")
+        if score > best_f1:
+            best_f1 = score
+            best_threshold = threshold
+
+    return best_threshold, best_f1
+
+
+def evaluate_binary_model(y_true, probability_1, threshold):
+    """Return required binary-classification metrics for the report."""
+    probability_0 = 1 - probability_1
+    labels = (probability_1 >= threshold).astype(int)
+
+    return {
+        "auc": roc_auc_score(y_true, probability_1),
+        "aucpr": average_precision_score(y_true, probability_1),
+        "log_loss": log_loss(y_true, np.column_stack([probability_0, probability_1])),
+        "confusion_matrix": confusion_matrix(y_true, labels),
+    }
+
+
+def summarize_coefficients(model, feature_names):
+    """
+    Create coefficient evidence for the Markdown report.
+
+    Include enough information to identify top positive and negative
+    coefficients and to explain how preprocessing, encoding, scaling, and
+    engineered features affect interpretation.
+    """
+    raise NotImplementedError("Summarize selected linear-model coefficients here.")
+
+
+def save_artifacts():
+    """
+    Save all artifacts required by your scoring file.
+
+    Include trained models, preprocessing objects, feature lists, feature order,
+    thresholds, and any model-specific metadata needed to reproduce scoring.
+    Use relative paths under artifacts/.
+    """
+    raise NotImplementedError("Save scoring artifacts here.")
+
+
+def save_report_outputs():
+    """
+    Save report-ready outputs.
+
+    Examples include metric summary CSV files and plots under artifacts/images/.
+    Reference generated images from your Markdown report with relative paths.
+    """
+    raise NotImplementedError("Save report tables and images here.")
+
+
+def main():
+    ensure_output_dirs()
+    df = load_training_data()
+
+    # Complete each step below. Keep the Test set locked until final evaluation.
+    run_data_quality_checks(df)
+    X_train, X_valid, X_test, y_train, y_valid, y_test = split_data(df)
+
+    # TODO: Complete preprocessing, feature engineering, tuning, evaluation,
+    # coefficient interpretation, final selection, artifact saving, and report
+    # output generation.
+    raise NotImplementedError("Complete the Project 1 workflow.")
+
+
+if __name__ == "__main__":
+    main()
