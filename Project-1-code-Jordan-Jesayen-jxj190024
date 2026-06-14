@@ -1,21 +1,22 @@
 """
 Project 1 Code Template
 SBA Loan Default Prediction
-
 Copy or rename this file to:
-
     Project-1-code-FirstName-LastName-NetID.py
-
 Complete this file with your data preparation, feature engineering, model
 tuning, evaluation, final model selection, and artifact-saving workflow.
-
 Final submission is Python code + Markdown report + artifacts, not a Jupyter
 notebook.
 """
-
+import json
+import os
+import pickle
+import warnings
 from pathlib import Path
 
-import h2o
+import matplotlib
+
+matplotlib.use("Agg")  # headless backend so plots save without a display
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -29,16 +30,45 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 
+# H2O is optional at import time so the rest of the pipeline can run even if
+# H2O is not installed in the current environment. The GLM step below checks
+# this flag and skips gracefully (with a clear message) when H2O is missing.
+try:
+    import h2o
+    from h2o.estimators.glm import H2OGeneralizedLinearEstimator
+    from h2o.grid.grid_search import H2OGridSearch
+
+    H2O_AVAILABLE = True
+except Exception:  # pragma: no cover - environment dependent
+    H2O_AVAILABLE = False
+
+warnings.filterwarnings("ignore", category=UserWarning)
 
 RANDOM_STATE = 42
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "data"
 ARTIFACTS_DIR = PROJECT_ROOT / "artifacts"
 IMAGES_DIR = ARTIFACTS_DIR / "images"
-
 TRAIN_DATA_PATH = DATA_DIR / "SBA_loans_project_1.csv.zip"
 HOLDOUT_FORMAT_PATH = DATA_DIR / "SBA_loans_project_1_holdout_students_valid_no_labels.csv.zip"
 TARGET_COL = "MIS_Status"
+
+# ---------------------------------------------------------------------------
+# Tuning / runtime configuration.
+# These env vars only exist to keep the file testable on a laptop. With no env
+# vars set, the code runs the full required workload (50+ HP combinations for
+# each model family, full dataset).
+# ---------------------------------------------------------------------------
+SAMPLE_N = os.environ.get("PROJECT1_SAMPLE_N")  # e.g. "40000" to subsample rows
+SAMPLE_N = int(SAMPLE_N) if SAMPLE_N else None
+MAX_COMBOS = os.environ.get("PROJECT1_MAX_COMBOS")  # cap combos when smoke-testing
+MAX_COMBOS = int(MAX_COMBOS) if MAX_COMBOS else None
+RUN_H2O = os.environ.get("PROJECT1_RUN_H2O", "1") != "0"
+
+# Categoricals with few levels -> one-hot encoded. Everything else categorical
+# (City, Bank, State, BankState, NAICS, Zip, FranchiseCode...) is high-cardinality
+# and gets smoothed target encoding fit on the training split only.
+LOW_CARD_MAX_LEVELS = 15
 
 
 def ensure_output_dirs():
@@ -47,31 +77,111 @@ def ensure_output_dirs():
     IMAGES_DIR.mkdir(exist_ok=True)
 
 
+def _resolve_train_path():
+    """
+    Robustly locate the training CSV.
+
+    The template expects ``data/SBA_loans_project_1.csv.zip`` but the file may
+    be a plain ``.csv`` (optionally with a trailing " 2" added by the OS), and
+    it may sit in the project root rather than ``data/``. Try the documented
+    path first, then fall back to any reasonable match so the script runs as-is.
+    """
+    if TRAIN_DATA_PATH.exists():
+        return TRAIN_DATA_PATH
+    candidates = []
+    for folder in (DATA_DIR, PROJECT_ROOT):
+        if folder.exists():
+            candidates += sorted(folder.glob("SBA_loans_project_1*.csv*"))
+    # Prefer labeled training files, exclude the unlabeled holdout export.
+    candidates = [c for c in candidates if "holdout" not in c.name.lower()]
+    if not candidates:
+        raise FileNotFoundError(
+            f"Could not find the training data. Looked for {TRAIN_DATA_PATH} and "
+            f"SBA_loans_project_1*.csv* under {DATA_DIR} and {PROJECT_ROOT}."
+        )
+    return candidates[0]
+
+
 def load_training_data():
     """Load the labeled Project 1 training data."""
-    return pd.read_csv(TRAIN_DATA_PATH)
+    path = _resolve_train_path()
+    df = pd.read_csv(path, low_memory=False)
+    # Drop a pure row-id column if present; it carries no signal.
+    for id_col in ("index", "Unnamed: 0"):
+        if id_col in df.columns:
+            df = df.drop(columns=[id_col])
+    if SAMPLE_N is not None and SAMPLE_N < len(df):
+        df = df.sample(n=SAMPLE_N, random_state=RANDOM_STATE).reset_index(drop=True)
+    return df
 
 
 def run_data_quality_checks(df):
     """
     Inspect missingness, types, invalid values, and target distribution.
-
     Save or print the checks that support your report. Do not fit learned
     transformations in this function.
     """
-    raise NotImplementedError("Add your data quality checks here.")
+    print("\n=== DATA QUALITY CHECKS ===")
+    print(f"Rows: {len(df):,}  Columns: {df.shape[1]}")
+
+    # Missingness.
+    missing = df.isna().sum()
+    missing = missing[missing > 0].sort_values(ascending=False)
+    missing_pct = (missing / len(df) * 100).round(2)
+    missing_tbl = pd.DataFrame({"n_missing": missing, "pct_missing": missing_pct})
+    print("\nColumns with missing values:")
+    print(missing_tbl if not missing_tbl.empty else "  (none)")
+
+    # Dtypes.
+    print("\nColumn dtypes:")
+    print(df.dtypes)
+
+    # Target distribution.
+    print(f"\nTarget '{TARGET_COL}' distribution:")
+    counts = df[TARGET_COL].value_counts(dropna=False)
+    rates = (counts / len(df) * 100).round(3)
+    print(pd.DataFrame({"count": counts, "pct": rates}))
+
+    # Suspicious / invalid values worth flagging in the report.
+    flags = {}
+    if "DisbursementGross" in df:
+        flags["disbursement_le_0"] = int((df["DisbursementGross"] <= 0).sum())
+    if "GrAppv" in df:
+        flags["grappv_le_0"] = int((df["GrAppv"] <= 0).sum())
+    if {"SBA_Appv", "GrAppv"}.issubset(df.columns):
+        flags["sba_gt_gross_approved"] = int((df["SBA_Appv"] > df["GrAppv"]).sum())
+    if "NewExist" in df:
+        flags["newexist_invalid_0"] = int((df["NewExist"] == 0).sum())
+    if "NAICS" in df:
+        flags["naics_zero_or_missing"] = int((df["NAICS"] <= 0).sum())
+    print("\nInvalid / suspicious value counts:")
+    print(json.dumps(flags, indent=2))
+
+    # Persist a compact summary for the report.
+    ensure_output_dirs()
+    missing_tbl.to_csv(ARTIFACTS_DIR / "data_quality_missingness.csv")
+    with open(ARTIFACTS_DIR / "data_quality_flags.json", "w") as fh:
+        json.dump(
+            {
+                "n_rows": int(len(df)),
+                "n_cols": int(df.shape[1]),
+                "target_counts": {str(k): int(v) for k, v in counts.items()},
+                "invalid_flags": flags,
+            },
+            fh,
+            indent=2,
+        )
+    return {"missing": missing_tbl, "flags": flags, "target_counts": counts}
 
 
 def split_data(df):
     """
     Split labeled data into Train, Validation, and Test.
-
     Split before fitting imputers, encoders, scalers, feature selectors,
     target encoders, WOE encoders, or models.
     """
     y = df[TARGET_COL]
     X = df.drop(columns=[TARGET_COL])
-
     X_train, X_temp, y_train, y_temp = train_test_split(
         X,
         y,
@@ -86,69 +196,369 @@ def split_data(df):
         random_state=RANDOM_STATE,
         stratify=y_temp,
     )
-
     return X_train, X_valid, X_test, y_train, y_valid, y_test
 
 
-def clean_and_prepare_train(X_train, y_train):
-    """
-    Fit training-only cleaning and preprocessing objects.
+# ---------------------------------------------------------------------------
+# Deterministic, stateless cleaning + feature engineering.
+# Nothing here is *fit* from data, so it is safe to apply to every split and to
+# the scoring/holdout file identically.
+# ---------------------------------------------------------------------------
+def _standardize_raw_categoricals(X):
+    """Map the known-messy categorical fields to clean, finite levels."""
+    X = X.copy()
 
-    Examples include imputers, categorical encoders, WOE/target encoders, and
-    scalers. Fit these objects on Train only. Return transformed Train data
-    plus a dictionary of fitted artifacts needed for Validation, Test, and
-    scoring.
-    """
-    raise NotImplementedError("Fit training-only preprocessing here.")
+    def map_yn(series):
+        s = series.astype("string").str.strip().str.upper()
+        out = pd.Series("MISSING", index=s.index, dtype="object")
+        out[s == "Y"] = "Y"
+        out[s == "N"] = "N"
+        out[s == "0"] = "N"  # RevLineCr/LowDoc encode some negatives as 0
+        out[s == "1"] = "Y"
+        out[~s.isin(["Y", "N", "0", "1"]) & s.notna()] = "OTHER"
+        return out
 
-
-def apply_cleaning_and_preprocessing(X, preprocessing_artifacts):
-    """
-    Apply fitted preprocessing objects to Validation, Test, or scoring data.
-
-    Use transform-style behavior only. Do not fit anything here.
-    """
-    raise NotImplementedError("Apply fitted preprocessing here.")
+    if "RevLineCr" in X:
+        X["RevLineCr"] = map_yn(X["RevLineCr"])
+    if "LowDoc" in X:
+        X["LowDoc"] = map_yn(X["LowDoc"])
+    # NewExist: 1 = existing, 2 = new; 0 / NaN are invalid -> 'UNK'.
+    if "NewExist" in X:
+        ne = pd.to_numeric(X["NewExist"], errors="coerce")
+        X["NewExist"] = np.where(ne == 1, "EXISTING", np.where(ne == 2, "NEW", "UNK"))
+    # UrbanRural: 0 = undefined, 1 = urban, 2 = rural.
+    if "UrbanRural" in X:
+        ur = pd.to_numeric(X["UrbanRural"], errors="coerce").fillna(0).astype(int)
+        X["UrbanRural"] = ur.map({0: "UNDEF", 1: "URBAN", 2: "RURAL"}).fillna("UNDEF")
+    return X
 
 
 def add_engineered_features(X):
     """
     Add at least 10 qualifying engineered features.
-
     One-hot encoded columns, label encoded columns, target encoded columns, and
     simple direct copies of existing columns do not count toward the 10 required
     engineered features. Keep this function reproducible so the same logic can
     be used in the scoring file.
     """
-    raise NotImplementedError("Create your engineered features here.")
+    X = _standardize_raw_categoricals(X)
+
+    gross_appv = pd.to_numeric(X.get("GrAppv"), errors="coerce")
+    sba_appv = pd.to_numeric(X.get("SBA_Appv"), errors="coerce")
+    disb = pd.to_numeric(X.get("DisbursementGross"), errors="coerce")
+    balance = pd.to_numeric(X.get("BalanceGross"), errors="coerce")
+    no_emp = pd.to_numeric(X.get("NoEmp"), errors="coerce")
+    create_job = pd.to_numeric(X.get("CreateJob"), errors="coerce")
+    retain_job = pd.to_numeric(X.get("RetainedJob"), errors="coerce")
+
+    eps = 1.0  # avoid divide-by-zero
+
+    # 1. Share of the loan guaranteed by the SBA (key risk/incentive signal).
+    X["sba_guarantee_ratio"] = (sba_appv / (gross_appv + eps)).clip(0, 1)
+    # 2. Portion of the loan NOT guaranteed (bank's own exposure).
+    X["bank_exposure_amt"] = (gross_appv - sba_appv).clip(lower=0)
+    # 3. Disbursed amount relative to approved (top-ups / under-draws).
+    X["disb_to_appv_ratio"] = disb / (gross_appv + eps)
+    # 4. Approved dollars per employee (leverage per worker).
+    X["appv_per_employee"] = gross_appv / (no_emp + eps)
+    # 5. Total jobs touched (created + retained).
+    X["total_jobs"] = (create_job.fillna(0) + retain_job.fillna(0))
+    # 6. Approved dollars per total job.
+    X["appv_per_job"] = gross_appv / (X["total_jobs"] + eps)
+    # 7. Log-scaled approved amount (tames heavy right skew for a linear model).
+    X["log_gross_appv"] = np.log1p(gross_appv.clip(lower=0))
+    # 8. Log-scaled disbursement.
+    X["log_disbursement"] = np.log1p(disb.clip(lower=0))
+    # 9. Outstanding balance present (data-quality / seasoning signal).
+    X["has_outstanding_balance"] = (balance.fillna(0) > 0).astype(int)
+    # 10. Borrower and lender in the same state (local-lending signal).
+    same_state = (
+        X.get("State", pd.Series(index=X.index)).astype("string").str.upper()
+        == X.get("BankState", pd.Series(index=X.index)).astype("string").str.upper()
+    )
+    X["same_state_lender"] = same_state.fillna(False).astype(int)
+    # 11. 2-digit NAICS sector (industry grouping; not a copy of raw NAICS).
+    naics = pd.to_numeric(X.get("NAICS"), errors="coerce").fillna(0).astype("int64")
+    X["naics_sector"] = (naics // 10000).astype(int).astype(str).replace("0", "UNK")
+    # 12. Franchise business flag (codes 0/1 mean "not a franchise").
+    fran = pd.to_numeric(X.get("FranchiseCode"), errors="coerce").fillna(0)
+    X["is_franchise"] = (fran > 1).astype(int)
+    # 13. Created any new jobs.
+    X["creates_jobs"] = (create_job.fillna(0) > 0).astype(int)
+    # 14. Large employer flag.
+    X["is_large_employer"] = (no_emp.fillna(0) >= 50).astype(int)
+    # 15. Gross-approval size bucket (ordinal).
+    X["appv_size_bucket"] = pd.cut(
+        gross_appv.fillna(0),
+        bins=[-1, 50_000, 150_000, 350_000, 1_000_000, np.inf],
+        labels=[0, 1, 2, 3, 4],
+    ).astype("float").fillna(0).astype(int)
+
+    return X
+
+
+# ---------------------------------------------------------------------------
+# Fitted preprocessing. Imputers / encoders / scaler are learned on TRAIN ONLY
+# and returned in an artifacts dict, then applied unchanged to valid/test/score.
+# ---------------------------------------------------------------------------
+def _smoothed_target_encoding(series, y, global_mean, smoothing=50.0):
+    """Return a {level: encoded_value} map using additive (Bayesian) smoothing."""
+    s = series.astype("string").fillna("MISSING")
+    stats = pd.DataFrame({"level": s.values, "y": y.values}).groupby("level")["y"]
+    counts = stats.count()
+    means = stats.mean()
+    encoded = (counts * means + smoothing * global_mean) / (counts + smoothing)
+    return encoded.to_dict()
+
+
+def clean_and_prepare_train(X_train, y_train):
+    """
+    Fit training-only cleaning and preprocessing objects.
+    Examples include imputers, categorical encoders, WOE/target encoders, and
+    scalers. Fit these objects on Train only. Return transformed Train data
+    plus a dictionary of fitted artifacts needed for Validation, Test, and
+    scoring.
+    """
+    y_train = pd.Series(np.asarray(y_train).astype(int), index=X_train.index)
+
+    # Partition columns by type/cardinality.
+    numeric_cols, low_card_cols, high_card_cols = [], [], []
+    for col in X_train.columns:
+        if pd.api.types.is_numeric_dtype(X_train[col]):
+            numeric_cols.append(col)
+        elif X_train[col].nunique(dropna=True) <= LOW_CARD_MAX_LEVELS:
+            low_card_cols.append(col)
+        else:
+            high_card_cols.append(col)
+
+    # Numeric: median impute (fit) then standardize (fit).
+    medians = {c: float(pd.to_numeric(X_train[c], errors="coerce").median()) for c in numeric_cols}
+    means, stds = {}, {}
+    for c in numeric_cols:
+        col = pd.to_numeric(X_train[c], errors="coerce").fillna(medians[c])
+        means[c] = float(col.mean())
+        std = float(col.std())
+        stds[c] = std if std > 1e-12 else 1.0
+
+    # Low-cardinality categoricals: store level lists for stable one-hot.
+    onehot_levels = {
+        c: sorted(X_train[c].astype("string").fillna("MISSING").unique().tolist())
+        for c in low_card_cols
+    }
+
+    # High-cardinality categoricals: smoothed target encoding.
+    global_mean = float(y_train.mean())
+    target_maps = {
+        c: _smoothed_target_encoding(X_train[c], y_train, global_mean)
+        for c in high_card_cols
+    }
+
+    artifacts = {
+        "numeric_cols": numeric_cols,
+        "low_card_cols": low_card_cols,
+        "high_card_cols": high_card_cols,
+        "medians": medians,
+        "means": means,
+        "stds": stds,
+        "onehot_levels": onehot_levels,
+        "target_maps": target_maps,
+        "global_mean": global_mean,
+    }
+
+    X_train_processed = apply_cleaning_and_preprocessing(X_train, artifacts)
+    artifacts["feature_order"] = X_train_processed.columns.tolist()
+    return X_train_processed, artifacts
+
+
+def apply_cleaning_and_preprocessing(X, preprocessing_artifacts):
+    """
+    Apply fitted preprocessing objects to Validation, Test, or scoring data.
+    Use transform-style behavior only. Do not fit anything here.
+    """
+    a = preprocessing_artifacts
+    frames = []
+
+    # Numeric: impute with train medians, scale with train mean/std.
+    num = {}
+    for c in a["numeric_cols"]:
+        col = pd.to_numeric(X[c], errors="coerce").fillna(a["medians"][c]) if c in X else \
+            pd.Series(a["medians"][c], index=X.index)
+        num[c] = (col - a["means"][c]) / a["stds"][c]
+    if num:
+        frames.append(pd.DataFrame(num, index=X.index))
+
+    # Low-cardinality: one-hot against train levels (unknown -> all zeros).
+    for c in a["low_card_cols"]:
+        s = X[c].astype("string").fillna("MISSING") if c in X else \
+            pd.Series("MISSING", index=X.index)
+        oh = {f"{c}__{lvl}": (s == lvl).astype(int) for lvl in a["onehot_levels"][c]}
+        frames.append(pd.DataFrame(oh, index=X.index))
+
+    # High-cardinality: map through train target-encoding (unseen -> global mean).
+    te = {}
+    for c in a["high_card_cols"]:
+        s = X[c].astype("string").fillna("MISSING") if c in X else \
+            pd.Series("MISSING", index=X.index)
+        te[c + "__te"] = s.map(a["target_maps"][c]).fillna(a["global_mean"]).astype(float)
+    if te:
+        frames.append(pd.DataFrame(te, index=X.index))
+
+    out = pd.concat(frames, axis=1)
+    out = out.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    # Guarantee identical column set/order once feature_order is known.
+    if "feature_order" in a:
+        out = out.reindex(columns=a["feature_order"], fill_value=0.0)
+    return out
 
 
 def tune_sklearn_logistic_regression(X_train, y_train, X_valid, y_valid):
     """
     Train and tune sklearn Logistic Regression variants.
-
     Requirements:
     - evaluate at least 50 hyperparameter combinations;
     - use AUCPR or Log-loss for tuning/model selection;
     - keep the Test set locked until final evaluation.
     """
-    raise NotImplementedError("Tune sklearn Logistic Regression models here.")
+    y_train = np.asarray(y_train).astype(int)
+    y_valid = np.asarray(y_valid).astype(int)
+
+    Cs = [0.001, 0.01, 0.1, 1.0, 10.0, 100.0]
+    class_weights = [None, "balanced"]
+
+    # Build the hyperparameter grid: l2, l1, and elasticnet (3 l1_ratios).
+    # 6 C x 2 cw x (1 + 1 + 3) = 60 combinations (>= 50 required).
+    grid = []
+    for C in Cs:
+        for cw in class_weights:
+            grid.append({"penalty": "l2", "C": C, "class_weight": cw})
+            grid.append({"penalty": "l1", "C": C, "class_weight": cw})
+            for r in (0.2, 0.5, 0.8):
+                grid.append(
+                    {"penalty": "elasticnet", "C": C, "l1_ratio": r, "class_weight": cw}
+                )
+
+    if MAX_COMBOS:  # smoke-test cap only
+        grid = grid[:MAX_COMBOS]
+
+    results = []
+    best = {"aucpr": -np.inf, "model": None, "params": None}
+    print(f"\n=== sklearn LogisticRegression: {len(grid)} combinations ===")
+    for i, params in enumerate(grid, 1):
+        model = LogisticRegression(
+            solver="saga",
+            penalty=params["penalty"],
+            C=params["C"],
+            l1_ratio=params.get("l1_ratio"),
+            class_weight=params["class_weight"],
+            max_iter=200,
+            tol=1e-3,
+            n_jobs=-1,
+            random_state=RANDOM_STATE,
+        )
+        model.fit(X_train, y_train)
+        p_valid = model.predict_proba(X_valid)[:, 1]
+        aucpr = average_precision_score(y_valid, p_valid)
+        ll = log_loss(y_valid, p_valid)
+        results.append(
+            {
+                "penalty": params["penalty"],
+                "C": params["C"],
+                "l1_ratio": params.get("l1_ratio"),
+                "class_weight": str(params["class_weight"]),
+                "valid_aucpr": aucpr,
+                "valid_log_loss": ll,
+            }
+        )
+        if aucpr > best["aucpr"]:
+            best = {"aucpr": aucpr, "model": model, "params": params}
+        if i % 10 == 0 or i == len(grid):
+            print(f"  [{i}/{len(grid)}] best valid AUCPR so far: {best['aucpr']:.4f}")
+
+    results_df = pd.DataFrame(results).sort_values("valid_aucpr", ascending=False)
+    return {
+        "model": best["model"],
+        "params": best["params"],
+        "valid_aucpr": best["aucpr"],
+        "results": results_df,
+    }
 
 
 def tune_h2o_glm(X_train, y_train, X_valid, y_valid):
     """
     Train and tune H2O-3 GLM binomial variants.
-
     Use bounded H2O initialization unless the instructor approves another setup:
-
         h2o.init(name="ML_Project_Cluster", max_mem_size="4G", nthreads=4, verbose=False)
-
     Requirements:
     - evaluate at least 50 hyperparameter combinations;
     - use AUCPR or Log-loss for tuning/model selection;
     - keep the Test set locked until final evaluation.
     """
-    raise NotImplementedError("Tune H2O-3 GLM models here.")
+    if not (H2O_AVAILABLE and RUN_H2O):
+        print(
+            "\n=== H2O GLM: SKIPPED ===\n"
+            "  H2O is not available in this environment (or PROJECT1_RUN_H2O=0). "
+            "Install h2o and re-run to train the GLM grid."
+        )
+        return None
+
+    h2o.init(name="ML_Project_Cluster", max_mem_size="4G", nthreads=4, verbose=False)
+
+    # Assemble labeled H2O frames. Target must be a factor for binomial GLM.
+    train_df = X_train.copy()
+    train_df[TARGET_COL] = np.asarray(y_train).astype(int)
+    valid_df = X_valid.copy()
+    valid_df[TARGET_COL] = np.asarray(y_valid).astype(int)
+
+    htrain = h2o.H2OFrame(train_df)
+    hvalid = h2o.H2OFrame(valid_df)
+    htrain[TARGET_COL] = htrain[TARGET_COL].asfactor()
+    hvalid[TARGET_COL] = hvalid[TARGET_COL].asfactor()
+    features = [c for c in X_train.columns]
+
+    # Grid: 5 alphas x 11 lambdas = 55 combinations (>= 50 required).
+    alphas = [0.0, 0.25, 0.5, 0.75, 1.0]
+    lambdas = [10 ** p for p in np.linspace(-6, -1, 11)]
+    hyper_params = {"alpha": alphas, "lambda": [float(l) for l in lambdas]}
+    if MAX_COMBOS:
+        hyper_params["lambda"] = hyper_params["lambda"][: max(1, MAX_COMBOS // len(alphas))]
+
+    grid = H2OGridSearch(
+        model=H2OGeneralizedLinearEstimator(
+            family="binomial",
+            lambda_search=False,
+            standardize=True,
+            seed=RANDOM_STATE,
+        ),
+        hyper_params=hyper_params,
+        grid_id="glm_grid_project1",
+    )
+    n_combos = len(alphas) * len(hyper_params["lambda"])
+    print(f"\n=== H2O GLM: {n_combos} combinations ===")
+    grid.train(x=features, y=TARGET_COL, training_frame=htrain, validation_frame=hvalid)
+
+    # Select on validation AUCPR.
+    sorted_grid = grid.get_grid(sort_by="aucpr", decreasing=True)
+    best_model = sorted_grid.models[0]
+    valid_aucpr = best_model.aucpr(valid=True)
+    print(f"  best valid AUCPR: {valid_aucpr:.4f}")
+
+    rows = []
+    for m in sorted_grid.models:
+        rows.append(
+            {
+                "alpha": m.actual_params.get("alpha"),
+                "lambda": m.actual_params.get("lambda"),
+                "valid_aucpr": m.aucpr(valid=True),
+                "valid_log_loss": m.logloss(valid=True),
+            }
+        )
+    return {
+        "model": best_model,
+        "valid_aucpr": valid_aucpr,
+        "results": pd.DataFrame(rows),
+        "features": features,
+    }
 
 
 def find_best_f1_threshold(y_true, probability_1):
@@ -156,14 +566,12 @@ def find_best_f1_threshold(y_true, probability_1):
     thresholds = np.linspace(0.01, 0.99, 99)
     best_threshold = None
     best_f1 = -np.inf
-
     for threshold in thresholds:
         labels = (probability_1 >= threshold).astype(int)
         score = f1_score(y_true, labels, average="macro")
         if score > best_f1:
             best_f1 = score
             best_threshold = threshold
-
     return best_threshold, best_f1
 
 
@@ -171,7 +579,6 @@ def evaluate_binary_model(y_true, probability_1, threshold):
     """Return required binary-classification metrics for the report."""
     probability_0 = 1 - probability_1
     labels = (probability_1 >= threshold).astype(int)
-
     return {
         "auc": roc_auc_score(y_true, probability_1),
         "aucpr": average_precision_score(y_true, probability_1),
@@ -183,47 +590,240 @@ def evaluate_binary_model(y_true, probability_1, threshold):
 def summarize_coefficients(model, feature_names):
     """
     Create coefficient evidence for the Markdown report.
-
     Include enough information to identify top positive and negative
     coefficients and to explain how preprocessing, encoding, scaling, and
     engineered features affect interpretation.
     """
-    raise NotImplementedError("Summarize selected linear-model coefficients here.")
+    coefs = np.asarray(model.coef_).ravel()
+    intercept = float(np.asarray(model.intercept_).ravel()[0])
+    df = pd.DataFrame({"feature": feature_names, "coefficient": coefs})
+    df["odds_ratio"] = np.exp(df["coefficient"])
+    df["abs_coefficient"] = df["coefficient"].abs()
+    df = df.sort_values("coefficient", ascending=False).reset_index(drop=True)
+
+    summary = {
+        "intercept": intercept,
+        "n_features": int(len(feature_names)),
+        "n_nonzero": int((df["coefficient"] != 0).sum()),
+        "top_positive": df.head(15),
+        "top_negative": df.tail(15).iloc[::-1],
+    }
+    # Note for the report: features were standardized (numeric) / target- or
+    # one-hot-encoded, so coefficients are on a comparable scale and represent
+    # the change in log-odds of default per 1-SD (numeric) or per category.
+    print("\n=== TOP POSITIVE COEFFICIENTS (push toward default) ===")
+    print(summary["top_positive"].to_string(index=False))
+    print("\n=== TOP NEGATIVE COEFFICIENTS (push toward repayment) ===")
+    print(summary["top_negative"].to_string(index=False))
+    return summary, df
+
+
+# Module-level holder so save_artifacts / save_report_outputs (which the
+# template declares with no parameters) can reach the trained objects.
+_STATE = {}
 
 
 def save_artifacts():
     """
     Save all artifacts required by your scoring file.
-
     Include trained models, preprocessing objects, feature lists, feature order,
     thresholds, and any model-specific metadata needed to reproduce scoring.
     Use relative paths under artifacts/.
     """
-    raise NotImplementedError("Save scoring artifacts here.")
+    ensure_output_dirs()
+
+    # Preprocessing objects + feature order (everything the scoring file needs).
+    with open(ARTIFACTS_DIR / "preprocessing.pkl", "wb") as fh:
+        pickle.dump(_STATE["preprocessing"], fh)
+
+    # Final selected model.
+    final_name = _STATE["final_model_name"]
+    if final_name == "sklearn_logreg":
+        with open(ARTIFACTS_DIR / "final_model_sklearn.pkl", "wb") as fh:
+            pickle.dump(_STATE["sklearn_model"], fh)
+    elif final_name == "h2o_glm" and H2O_AVAILABLE:
+        h2o.save_model(_STATE["h2o_model"], path=str(ARTIFACTS_DIR), force=True)
+
+    # Also persist the sklearn model whenever it exists (useful fallback).
+    if _STATE.get("sklearn_model") is not None:
+        with open(ARTIFACTS_DIR / "final_model_sklearn.pkl", "wb") as fh:
+            pickle.dump(_STATE["sklearn_model"], fh)
+
+    metadata = {
+        "final_model_name": final_name,
+        "decision_threshold": float(_STATE["threshold"]),
+        "feature_order": _STATE["preprocessing"].get("feature_order", []),
+        "target_col": TARGET_COL,
+        "random_state": RANDOM_STATE,
+        "engineered_feature_note": (
+            "Apply add_engineered_features(), then "
+            "apply_cleaning_and_preprocessing(X, preprocessing) before predicting."
+        ),
+    }
+    with open(ARTIFACTS_DIR / "model_metadata.json", "w") as fh:
+        json.dump(metadata, fh, indent=2)
+    print(f"\nSaved artifacts to {ARTIFACTS_DIR}")
 
 
 def save_report_outputs():
     """
     Save report-ready outputs.
-
     Examples include metric summary CSV files and plots under artifacts/images/.
     Reference generated images from your Markdown report with relative paths.
     """
-    raise NotImplementedError("Save report tables and images here.")
+    ensure_output_dirs()
+
+    # Metric summary table across models / splits.
+    _STATE["metrics_table"].to_csv(ARTIFACTS_DIR / "metric_summary.csv", index=False)
+
+    # Tuning result tables.
+    if _STATE.get("sklearn_results") is not None:
+        _STATE["sklearn_results"].to_csv(
+            ARTIFACTS_DIR / "sklearn_tuning_results.csv", index=False
+        )
+    if _STATE.get("h2o_results") is not None:
+        _STATE["h2o_results"].to_csv(
+            ARTIFACTS_DIR / "h2o_tuning_results.csv", index=False
+        )
+
+    # Coefficient table.
+    if _STATE.get("coef_table") is not None:
+        _STATE["coef_table"].to_csv(ARTIFACTS_DIR / "coefficients.csv", index=False)
+
+    # Plot 1: confusion matrix of the final model on the test set.
+    cm = _STATE["test_metrics"]["confusion_matrix"]
+    fig, ax = plt.subplots(figsize=(4.5, 4))
+    im = ax.imshow(cm, cmap="Blues")
+    ax.set_xticks([0, 1]); ax.set_yticks([0, 1])
+    ax.set_xticklabels(["Pred 0", "Pred 1"]); ax.set_yticklabels(["True 0", "True 1"])
+    ax.set_title("Final model — Test confusion matrix")
+    for (r, c), v in np.ndenumerate(cm):
+        ax.text(c, r, f"{v:,}", ha="center", va="center",
+                color="white" if v > cm.max() / 2 else "black")
+    fig.colorbar(im, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(IMAGES_DIR / "confusion_matrix.png", dpi=130)
+    plt.close(fig)
+
+    # Plot 2: top coefficients (signed) for interpretation.
+    if _STATE.get("coef_summary") is not None:
+        top = pd.concat(
+            [_STATE["coef_summary"]["top_positive"].head(10),
+             _STATE["coef_summary"]["top_negative"].head(10)]
+        ).sort_values("coefficient")
+        fig, ax = plt.subplots(figsize=(7, 6))
+        colors = ["#c0392b" if v > 0 else "#2471a3" for v in top["coefficient"]]
+        ax.barh(top["feature"], top["coefficient"], color=colors)
+        ax.axvline(0, color="black", lw=0.8)
+        ax.set_title("Top default-risk coefficients (log-odds)")
+        ax.set_xlabel("Coefficient")
+        fig.tight_layout()
+        fig.savefig(IMAGES_DIR / "top_coefficients.png", dpi=130)
+        plt.close(fig)
+
+    print(f"Saved report tables and images to {ARTIFACTS_DIR}")
+
+
+def _h2o_predict_proba(model, X):
+    """Return P(default=1) from a fitted H2O binomial model for frame X."""
+    hf = h2o.H2OFrame(X)
+    preds = model.predict(hf).as_data_frame()
+    # H2O binomial output has a 'p1' column = P(class==1).
+    return preds["p1"].to_numpy()
 
 
 def main():
     ensure_output_dirs()
     df = load_training_data()
-
     # Complete each step below. Keep the Test set locked until final evaluation.
     run_data_quality_checks(df)
     X_train, X_valid, X_test, y_train, y_valid, y_test = split_data(df)
 
-    # TODO: Complete preprocessing, feature engineering, tuning, evaluation,
-    # coefficient interpretation, final selection, artifact saving, and report
-    # output generation.
-    raise NotImplementedError("Complete the Project 1 workflow.")
+    # 1) Feature engineering (deterministic, applied to every split identically).
+    X_train_fe = add_engineered_features(X_train)
+    X_valid_fe = add_engineered_features(X_valid)
+    X_test_fe = add_engineered_features(X_test)
+
+    # 2) Fit preprocessing on TRAIN ONLY, then transform valid/test.
+    X_train_p, preprocessing = clean_and_prepare_train(X_train_fe, y_train)
+    X_valid_p = apply_cleaning_and_preprocessing(X_valid_fe, preprocessing)
+    X_test_p = apply_cleaning_and_preprocessing(X_test_fe, preprocessing)
+    feature_names = preprocessing["feature_order"]
+    _STATE["preprocessing"] = preprocessing
+
+    # 3) Tune sklearn Logistic Regression (Test stays locked).
+    sk = tune_sklearn_logistic_regression(X_train_p, y_train, X_valid_p, y_valid)
+    _STATE["sklearn_model"] = sk["model"]
+    _STATE["sklearn_results"] = sk["results"]
+
+    # 4) Tune H2O GLM (optional / when installed).
+    h2o_res = tune_h2o_glm(X_train_p, y_train, X_valid_p, y_valid)
+    _STATE["h2o_model"] = h2o_res["model"] if h2o_res else None
+    _STATE["h2o_results"] = h2o_res["results"] if h2o_res else None
+
+    # 5) Pick the final model by VALIDATION AUCPR (Test still locked).
+    candidates = {"sklearn_logreg": sk["valid_aucpr"]}
+    if h2o_res:
+        candidates["h2o_glm"] = h2o_res["valid_aucpr"]
+    final_name = max(candidates, key=candidates.get)
+    _STATE["final_model_name"] = final_name
+    print(f"\n=== MODEL SELECTION (by valid AUCPR) ===\n  {candidates}\n  -> {final_name}")
+
+    # Validation probabilities of the chosen model -> tune F1 threshold on VALID.
+    if final_name == "sklearn_logreg":
+        p_valid = sk["model"].predict_proba(X_valid_p)[:, 1]
+    else:
+        p_valid = _h2o_predict_proba(h2o_res["model"], X_valid_p)
+    threshold, valid_f1 = find_best_f1_threshold(np.asarray(y_valid).astype(int), p_valid)
+    _STATE["threshold"] = threshold
+    print(f"  chosen decision threshold (max macro-F1 on valid): {threshold:.2f} (F1={valid_f1:.4f})")
+
+    # 6) FINAL, one-time evaluation on the locked Test set.
+    if final_name == "sklearn_logreg":
+        p_test = sk["model"].predict_proba(X_test_p)[:, 1]
+    else:
+        p_test = _h2o_predict_proba(h2o_res["model"], X_test_p)
+    test_metrics = evaluate_binary_model(np.asarray(y_test).astype(int), p_test, threshold)
+    _STATE["test_metrics"] = test_metrics
+    print("\n=== FINAL TEST METRICS ===")
+    print(f"  AUC     : {test_metrics['auc']:.4f}")
+    print(f"  AUCPR   : {test_metrics['aucpr']:.4f}")
+    print(f"  LogLoss : {test_metrics['log_loss']:.4f}")
+    print(f"  Confusion matrix:\n{test_metrics['confusion_matrix']}")
+
+    # 7) Coefficient interpretation (sklearn linear model).
+    coef_summary, coef_table = summarize_coefficients(sk["model"], feature_names)
+    _STATE["coef_summary"] = coef_summary
+    _STATE["coef_table"] = coef_table
+
+    # 8) Build a tidy metric summary across splits for the report.
+    rows = []
+    for split_name, Xp, yv in [
+        ("train", X_train_p, y_train),
+        ("valid", X_valid_p, y_valid),
+        ("test", X_test_p, y_test),
+    ]:
+        if final_name == "sklearn_logreg":
+            p = sk["model"].predict_proba(Xp)[:, 1]
+        else:
+            p = _h2o_predict_proba(h2o_res["model"], Xp)
+        m = evaluate_binary_model(np.asarray(yv).astype(int), p, threshold)
+        rows.append(
+            {
+                "model": final_name,
+                "split": split_name,
+                "auc": m["auc"],
+                "aucpr": m["aucpr"],
+                "log_loss": m["log_loss"],
+                "threshold": threshold,
+            }
+        )
+    _STATE["metrics_table"] = pd.DataFrame(rows)
+
+    # 9) Persist scoring artifacts and report outputs.
+    save_artifacts()
+    save_report_outputs()
+    print("\nDone. Final model:", final_name)
 
 
 if __name__ == "__main__":
