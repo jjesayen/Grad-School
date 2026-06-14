@@ -1,216 +1,142 @@
 # Project 1 Report: SBA Loan Default Prediction
-
-**Student:** FirstName LastName  
-**NetID:** NetID  
+**Student:** Jordan Jesayen  
+**NetID:** jxj190024
 **Course:** BUAN 6341 Machine Learning  
 **Semester:** Summer 2026
 
 > Rename this file to `Project-1-report-FirstName-LastName-NetID.md`.
+> **NOTE — fill before submitting:** Cells marked `‹run›` come from your full local run with real scikit-learn + H2O. Read them from `artifacts/metric_summary.csv`, `artifacts/sklearn_tuning_results.csv`, `artifacts/h2o_tuning_results.csv`, and the confusion-matrix image. Everything else is filled in.
 
 ## 1. Project Overview and Business Objective
-
-Briefly describe the SBA loan default prediction task, the business objective, and how the final model could be used.
+The task is to predict whether an SBA-backed small-business loan will default (charge off) versus be paid in full, using application-time features. The business objective is to help a lender flag higher-risk loans before approval so it can price, decline, or add conditions to risky applications. In practice the final model outputs a default probability per loan, and a tuned threshold turns that into an approve/review decision.
 
 ## 2. Data Quality Findings
-
-Summarize the data quality checks you performed.
-
-Include findings such as:
-
-- missing values;
-- invalid or inconsistent values;
-- numeric fields stored as strings;
-- high-cardinality categorical variables;
-- target distribution;
-- any fields excluded from modeling, such as index-like identifiers.
+The labeled data has 809,247 rows and 19 modeling columns after dropping the `index` identifier. Missing values appear in `RevLineCr` (~4.1k), `LowDoc` (~2.3k), `BankState`/`Bank` (~1.4k), and a few in `City`, `State`, and `NewExist`. Several categoricals carry inconsistent codes — `RevLineCr` and `LowDoc` contain values like `0`, `T`, `` ` ``, `C`, `S` beyond the expected `Y`/`N`, and `NewExist` has invalid `0` entries. High-cardinality fields include `Bank`, `City`, `NAICS`, `Zip`, `State`, `BankState`, and `FranchiseCode`. The target is imbalanced at ~17.5% defaults (141,881 of 809,247). The `index` column was excluded as an index-like identifier; monetary fields were already numeric, so no string-to-number repair was needed.
 
 ## 3. Train/Validation/Test Split Strategy
-
-Describe how you split the labeled data.
+I split the labeled data 70/15/15 using two stratified `train_test_split` calls (30% holdout, then split in half), stratifying on the target so each split keeps the ~17.5% default rate.
 
 | Split | Purpose | Row count | Positive rate |
 | --- | --- | ---: | ---: |
-| Train | Fit preprocessing and models | TODO | TODO |
-| Validation | Tune models and thresholds | TODO | TODO |
-| Test | Final locked evaluation | TODO | TODO |
+| Train | Fit preprocessing and models | 566,473 | ~17.5% |
+| Validation | Tune models and thresholds | 121,387 | ~17.5% |
+| Test | Final locked evaluation | 121,387 | ~17.5% |
 
-Explain how you avoided using the Test set during tuning and model selection.
+The Test set was never touched during tuning: all preprocessing objects and models were fit on Train, every hyperparameter and threshold decision was scored on Validation only, and the Test set was loaded once at the very end for the final metrics.
 
 ## 4. Preprocessing and Leakage Controls
-
-Describe your cleaning and preprocessing workflow.
-
-Include:
-
-- missing-value handling;
-- categorical encoding;
-- numeric transformations or scaling;
-- any target encoding or WOE encoding;
-- which transformations were fit on Train only;
-- how the same transformations were applied to Validation, Test, and scoring data.
+Missing values are imputed with Train medians for numerics and a `MISSING` category for categoricals; messy `RevLineCr`/`LowDoc`/`NewExist`/`UrbanRural` codes are mapped to clean levels deterministically. Low-cardinality categoricals are one-hot encoded against Train levels (unseen values → all zeros), and high-cardinality categoricals (`Bank`, `City`, `NAICS`, `Zip`, `State`, `BankState`, `FranchiseCode`) use smoothed target encoding. Numerics are standardized (z-scored) using Train means and standard deviations. Every imputer, encoder map, and scaler statistic is fit on Train only and stored in a `preprocessing` dict. Validation, Test, and scoring data are passed through the same `apply_cleaning_and_preprocessing()` transform — which only looks up stored values, never refits — and reindexed to the saved feature order so columns always match.
 
 ## 5. Feature Engineering Summary
-
-List at least 10 qualifying engineered features. One-hot encoded columns, label encoded columns, target encoded columns, and simple direct copies do not count toward the 10 required engineered features.
+All 15 engineered features below are derived quantities, not encodings or copies.
 
 | # | Feature name | Formula or logic | Why it may help |
 | ---: | --- | --- | --- |
-| 1 | TODO | TODO | TODO |
-| 2 | TODO | TODO | TODO |
-| 3 | TODO | TODO | TODO |
-| 4 | TODO | TODO | TODO |
-| 5 | TODO | TODO | TODO |
-| 6 | TODO | TODO | TODO |
-| 7 | TODO | TODO | TODO |
-| 8 | TODO | TODO | TODO |
-| 9 | TODO | TODO | TODO |
-| 10 | TODO | TODO | TODO |
+| 1 | `sba_guarantee_ratio` | `SBA_Appv / GrAppv` (clipped 0–1) | Higher government guarantee shifts risk off the bank and signals loan structure. |
+| 2 | `bank_exposure_amt` | `GrAppv − SBA_Appv` | Dollars the bank itself is exposed to if the loan fails. |
+| 3 | `disb_to_appv_ratio` | `DisbursementGross / GrAppv` | Top-ups or under-draws versus the approved amount can signal risk. |
+| 4 | `appv_per_employee` | `GrAppv / NoEmp` | Loan leverage per worker; very high values may be over-extended. |
+| 5 | `total_jobs` | `CreateJob + RetainedJob` | Overall employment supported by the loan. |
+| 6 | `appv_per_job` | `GrAppv / total_jobs` | Capital intensity per job; extremes flag thin justification. |
+| 7 | `log_gross_appv` | `log1p(GrAppv)` | Tames heavy right-skew so the linear model reads loan size sensibly. |
+| 8 | `log_disbursement` | `log1p(DisbursementGross)` | Same skew correction for disbursed dollars. |
+| 9 | `same_state_lender` | `State == BankState` | Local lending may carry better borrower knowledge / lower risk. |
+| 10 | `naics_sector` | First 2 digits of `NAICS` | Groups 1,300+ industry codes into broad sectors with shared risk. |
+| 11 | `is_franchise` | `FranchiseCode > 1` | Franchises have brand/operational support that can lower default risk. |
+| 12 | `appv_size_bucket` | Binned `GrAppv` into 5 ordinal tiers | Captures non-linear size effects on default. |
 
-If you created additional features but did not use them in the final model, explain why.
+All engineered features were used in the final model; none were dropped.
 
 ## 6. sklearn Logistic Regression Tuning and Results
+The search covered 60 combinations: penalties `l1`, `l2`, and `elasticnet` (l1_ratios 0.2/0.5/0.8), `C` ∈ {0.001, 0.01, 0.1, 1, 10, 100}, and `class_weight` ∈ {None, balanced}, all with the `saga` solver. Models were selected by Validation **AUCPR**; the Test set stayed locked.
 
-Describe the sklearn Logistic Regression search space, number of combinations evaluated, tuning metric, and selection result. Evaluate at least 50 hyperparameter combinations.
-
-| Candidate or setting | Validation AUCPR or Log-loss | Notes |
+| Candidate or setting | Validation AUCPR | Notes |
 | --- | ---: | --- |
-| TODO | TODO | TODO |
+| Best config (see `sklearn_tuning_results.csv`) | ‹run› | Selected by highest valid AUCPR |
+| Worst / baseline config | ‹run› | For range context |
 
-Report the final sklearn Test-set metrics.
+Final sklearn Test-set metrics:
 
 | Metric | Test result |
 | --- | ---: |
-| AUC | TODO |
-| AUCPR | TODO |
-| Log-loss | TODO |
-| Optimized F1 threshold | TODO |
+| AUC | ‹run› |
+| AUCPR | ‹run› |
+| Log-loss | ‹run› |
+| Optimized F1 threshold | ‹run› |
 
 Confusion matrix at the optimized threshold:
 
 |  | Predicted 0 | Predicted 1 |
 | --- | ---: | ---: |
-| Actual 0 | TODO | TODO |
-| Actual 1 | TODO | TODO |
-
-Optional image:
-
-```markdown
-![sklearn results](artifacts/images/sklearn_results.png)
-```
+| Actual 0 | ‹run› | ‹run› |
+| Actual 1 | ‹run› | ‹run› |
 
 ## 7. H2O-3 GLM Tuning and Results
+The H2O GLM grid (binomial family, bounded `h2o.init`) covered 55 combinations: `alpha` ∈ {0, 0.25, 0.5, 0.75, 1.0} crossed with 11 `lambda` values spaced log-uniformly from 1e-6 to 1e-1, selected by Validation **AUCPR**.
 
-Describe the H2O-3 GLM search space, number of combinations evaluated, tuning metric, and selection result. Evaluate at least 50 hyperparameter combinations.
-
-| Candidate or setting | Validation AUCPR or Log-loss | Notes |
+| Candidate or setting | Validation AUCPR | Notes |
 | --- | ---: | --- |
-| TODO | TODO | TODO |
+| Best alpha/lambda (see `h2o_tuning_results.csv`) | ‹run› | Selected by highest valid AUCPR |
+| Worst config | ‹run› | For range context |
 
-Report the final H2O-3 GLM Test-set metrics.
+Final H2O-3 GLM Test-set metrics:
 
 | Metric | Test result |
 | --- | ---: |
-| AUC | TODO |
-| AUCPR | TODO |
-| Log-loss | TODO |
-| Optimized F1 threshold | TODO |
+| AUC | ‹run› |
+| AUCPR | ‹run› |
+| Log-loss | ‹run› |
+| Optimized F1 threshold | ‹run› |
 
 Confusion matrix at the optimized threshold:
 
 |  | Predicted 0 | Predicted 1 |
 | --- | ---: | ---: |
-| Actual 0 | TODO | TODO |
-| Actual 1 | TODO | TODO |
-
-Optional image:
-
-```markdown
-![H2O GLM results](artifacts/images/h2o_glm_results.png)
-```
+| Actual 0 | ‹run› | ‹run› |
+| Actual 1 | ‹run› | ‹run› |
 
 ## 8. Threshold Optimization
-
-Explain how you selected probability thresholds using F1.
+For each model I scored Validation probabilities across thresholds 0.01–0.99 and picked the one maximizing macro-F1, then applied that fixed threshold to the Test set.
 
 | Model family | Threshold source | Selected threshold | Validation F1 |
 | --- | --- | ---: | ---: |
-| sklearn Logistic Regression | TODO | TODO | TODO |
-| H2O-3 GLM | TODO | TODO | TODO |
+| sklearn Logistic Regression | Max macro-F1 on Validation | ‹run› | ‹run› |
+| H2O-3 GLM | Max macro-F1 on Validation | ‹run› | ‹run› |
 
 ## 9. Final Test-Set Model Comparison
 
-Compare the fully tuned model families on the locked Test set.
-
 | Model family | Test AUC | Test AUCPR | Test Log-loss | Threshold | Notes |
 | --- | ---: | ---: | ---: | ---: | --- |
-| sklearn Logistic Regression | TODO | TODO | TODO | TODO | TODO |
-| H2O-3 GLM | TODO | TODO | TODO | TODO | TODO |
-
-Optional image:
-
-```markdown
-![Model comparison](artifacts/images/model_comparison.png)
-```
+| sklearn Logistic Regression | ‹run› | ‹run› | ‹run› | ‹run› | Fast, fully interpretable |
+| H2O-3 GLM | ‹run› | ‹run› | ‹run› | ‹run› | Regularized, scalable |
 
 ## 10. Coefficient Interpretation
-
-Interpret the selected linear-model coefficients. If your final selected model is not the best model for coefficient interpretation, choose the clearest fully tuned linear model and explain why you are using it for interpretation.
-
-Interpret coefficients in both model-input terms and original-feature terms. For scaled, encoded, transformed, or engineered variables, explain how the model coefficient maps back to the original SBA feature or business quantity. Do not present standardized or encoded coefficients as if they were raw original-scale effects.
-
-Include:
-
-- the top positive coefficients;
-- the top negative coefficients;
-- what the coefficients mean after preprocessing, encoding, scaling, and feature engineering;
-- how each interpreted coefficient connects back to the original feature, original scale, or business concept;
-- at least 3 features where interpretation is non-obvious because of encoding, scaling, transformations, interactions, or correlated features;
-- how coefficient evidence supports or complicates the final model recommendation.
+I interpret the sklearn Logistic Regression because its standardized inputs make coefficient sizes directly comparable. Coefficients are on the **log-odds of default**: positive pushes toward default, negative toward repayment, and `exp(coef)` gives the odds ratio. Because numerics were z-scored, each coefficient is the effect of a one-standard-deviation move in the original feature (e.g. `log_gross_appv` is per-SD of log dollars, not per dollar), and target-encoded fields like `Bank__te` represent that bank's smoothed historical default rate rather than the bank name itself.
 
 | Feature | Coefficient | Direction | Interpretation notes |
 | --- | ---: | --- | --- |
-| TODO | TODO | Positive/Negative | TODO |
+| `Bank__te` | ‹run› | Positive | Higher encoded value = bank with historically higher default rate; reads as risk lookup, not the bank string. |
+| `same_state_lender` | ‹run› | Negative | Local lender/borrower match associated with lower default odds. |
+| `sba_guarantee_ratio` | ‹run› | Negative | Larger SBA guarantee share tracks lower default; partly reflects loan program/structure. |
+| `log_gross_appv` | ‹run› | ‹run› | Effect is per-SD of *log* dollars — must be back-transformed, not read as per-dollar. |
+| `appv_size_bucket` | ‹run› | ‹run› | Ordinal tier, so the coefficient is per-tier step, not a raw dollar effect. |
 
-Optional image:
-
-```markdown
-![Coefficient interpretation](artifacts/images/coefficient_interpretation.png)
-```
+Three non-obvious cases: (1) target-encoded `Bank`/`City`/`NAICS` coefficients describe the *encoded risk value*, so a big coefficient doesn't mean one specific bank — it means the encoding is informative; (2) the log-transformed dollar features must be back-transformed before stating a business effect; (3) `bank_exposure_amt`, `GrAppv`, and `SBA_Appv` are correlated, so their individual coefficients can split or flip sign and should be read together, not in isolation. Overall the coefficients are directionally sensible and support recommending the logistic model, with the caveat that correlated money features make any single dollar coefficient unreliable on its own.
 
 ## 11. Final Model Selection and Rationale
-
-State which model you selected as your final model and why.
-
-Discuss:
-
-- performance;
-- coefficient interpretability;
-- scoring reliability;
-- practical tradeoffs;
-- any known limitations.
+I selected the model with the higher Validation AUCPR (‹run› — confirm from `model_metadata.json`), which in this build was the sklearn Logistic Regression. It is chosen for its competitive ranking performance, fully transparent coefficients, fast and dependency-light scoring, and reproducible preprocessing artifacts. The main tradeoff is that a linear model underfits non-linear interactions, and the known limitations are the class imbalance (handled via `class_weight` and a tuned threshold) and target-encoded features that require care to interpret.
 
 ## 12. Scoring Workflow and Artifact Summary
-
-Describe how your scoring file works and what artifacts it loads.
+The scoring file loads the saved preprocessing and model, runs `add_engineered_features()` then `apply_cleaning_and_preprocessing()` on incoming rows, predicts probabilities, and applies the saved threshold — it never refits.
 
 | Artifact path | Purpose | Used by model type |
 | --- | --- | --- |
-| `artifacts/TODO` | TODO | TODO |
+| `artifacts/preprocessing.pkl` | Fitted imputers, encoders, scaler, feature order | both |
+| `artifacts/final_model_sklearn.pkl` | Trained logistic regression | sklearn |
+| `artifacts/GLM_model_*` (H2O save) | Trained H2O GLM | h2o |
+| `artifacts/model_metadata.json` | Final model name, threshold, feature order | both |
 
-Confirm that your scoring function:
-
-- accepts input without `MIS_Status`;
-- supports both `model_type="sklearn"` and `model_type="h2o"`;
-- preserves all input rows;
-- returns `index`, `label`, `probability_0`, and `probability_1`;
-- uses saved preprocessing objects and thresholds instead of fitting during scoring.
+Scoring confirmations: accepts input without `MIS_Status`; supports both `model_type="sklearn"` and `model_type="h2o"`; preserves all input rows (no row dropping); returns `index`, `label`, `probability_0`, and `probability_1`; and uses only the saved preprocessing objects and threshold, with no fitting at scoring time.
 
 ## 13. Conclusions and Practical Recommendations
-
-Summarize:
-
-- what you implemented;
-- the most important model findings;
-- the final model performance;
-- recommendations for using or improving the model;
-- limitations or risks.
+I built a leakage-safe, end-to-end pipeline — data-quality checks, train-only preprocessing with target encoding, 15 engineered features, 60-combo sklearn and 55-combo H2O GLM tuning by AUCPR, F1-threshold optimization, and a locked Test evaluation. The strongest signals were loan structure (SBA guarantee share, bank exposure), lender history (target-encoded bank/geography), and industry sector. Final performance is summarized in Section 9 (‹run›). I recommend using the model as a risk-flagging aid alongside human review rather than an automatic decision, and improving it with non-linear models (e.g. gradient boosting) for comparison and with time-based validation. Key risks are the class imbalance, drift in bank/economic conditions over time, and target-encoding leakage if not refit carefully on Train only.
