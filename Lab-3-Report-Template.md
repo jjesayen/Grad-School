@@ -1,8 +1,8 @@
 # Lab 3 Report Template
 
-Name:
+Name: Jordan Jesayen
 
-NetID:
+NetID: jxj190024
 
 Use this template to create `Lab-3-Report.md`. Keep final code in `Lab-3-Assignment.py` and save referenced plots, tables, or other outputs under `artifacts/`.
 
